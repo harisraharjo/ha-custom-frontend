@@ -1,0 +1,4 @@
+#!/bin/bash
+hass -c config &
+cd homeassistant/components/ui 
+pnpm dev

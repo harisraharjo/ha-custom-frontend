@@ -1,0 +1,266 @@
+"""Tests for the Rain Bird config flow."""
+
+import asyncio
+from collections.abc import Generator
+from http import HTTPStatus
+from typing import Any
+from unittest.mock import Mock, patch
+
+import pytest
+
+from homeassistant import config_entries
+from homeassistant.components.rainbird import DOMAIN
+from homeassistant.components.rainbird.const import ATTR_DURATION
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import CONF_HOST, CONF_PASSWORD
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResult, FlowResultType
+
+from .conftest import (
+    CONFIG_ENTRY_DATA,
+    HOST,
+    PASSWORD,
+    SERIAL_NUMBER,
+    SERIAL_RESPONSE,
+    URL,
+    ZERO_SERIAL_RESPONSE,
+    ComponentSetup,
+    mock_response,
+)
+
+from tests.test_util.aiohttp import AiohttpClientMocker, AiohttpClientMockResponse
+
+
+@pytest.fixture(name="responses")
+def mock_responses() -> list[AiohttpClientMockResponse]:
+    """Set up fake serial number response when testing the connection."""
+    return [mock_response(SERIAL_RESPONSE)]
+
+
+@pytest.fixture(autouse=True)
+async def config_entry_data() -> None:
+    """Fixture to disable config entry setup for exercising config flow."""
+    return None
+
+
+@pytest.fixture(autouse=True)
+async def mock_setup() -> Generator[Mock, None, None]:
+    """Fixture for patching out integration setup."""
+
+    with patch(
+        "homeassistant.components.rainbird.async_setup_entry",
+        return_value=True,
+    ) as mock_setup:
+        yield mock_setup
+
+
+async def complete_flow(hass: HomeAssistant) -> FlowResult:
+    """Start the config flow and enter the host and password."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result.get("type") == FlowResultType.FORM
+    assert result.get("step_id") == "user"
+    assert not result.get("errors")
+    assert "flow_id" in result
+
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: HOST, CONF_PASSWORD: PASSWORD},
+    )
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_config_entry", "expected_unique_id"),
+    [
+        (
+            [mock_response(SERIAL_RESPONSE)],
+            CONFIG_ENTRY_DATA,
+            SERIAL_NUMBER,
+        ),
+        (
+            [mock_response(ZERO_SERIAL_RESPONSE)],
+            {**CONFIG_ENTRY_DATA, "serial_number": 0},
+            None,
+        ),
+    ],
+)
+async def test_controller_flow(
+    hass: HomeAssistant,
+    mock_setup: Mock,
+    expected_config_entry: dict[str, str],
+    expected_unique_id: int | None,
+) -> None:
+    """Test the controller is setup correctly."""
+
+    result = await complete_flow(hass)
+    assert result.get("type") == "create_entry"
+    assert result.get("title") == HOST
+    assert "result" in result
+    assert dict(result["result"].data) == expected_config_entry
+    assert result["result"].options == {ATTR_DURATION: 6}
+    assert result["result"].unique_id == expected_unique_id
+
+    assert len(mock_setup.mock_calls) == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "unique_id",
+        "config_entry_data",
+        "config_flow_responses",
+        "expected_config_entry",
+    ),
+    [
+        (
+            "other-serial-number",
+            {**CONFIG_ENTRY_DATA, "host": "other-host"},
+            [mock_response(SERIAL_RESPONSE)],
+            CONFIG_ENTRY_DATA,
+        ),
+        (
+            None,
+            {**CONFIG_ENTRY_DATA, "serial_number": 0, "host": "other-host"},
+            [mock_response(ZERO_SERIAL_RESPONSE)],
+            {**CONFIG_ENTRY_DATA, "serial_number": 0},
+        ),
+    ],
+    ids=["with-serial", "zero-serial"],
+)
+async def test_multiple_config_entries(
+    hass: HomeAssistant,
+    setup_integration: ComponentSetup,
+    responses: list[AiohttpClientMockResponse],
+    config_flow_responses: list[AiohttpClientMockResponse],
+    expected_config_entry: dict[str, Any] | None,
+) -> None:
+    """Test setting up multiple config entries that refer to different devices."""
+    assert await setup_integration()
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert len(entries) == 1
+    assert entries[0].state == ConfigEntryState.LOADED
+
+    responses.clear()
+    responses.extend(config_flow_responses)
+
+    result = await complete_flow(hass)
+    assert result.get("type") == FlowResultType.CREATE_ENTRY
+    assert dict(result.get("result").data) == expected_config_entry
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert len(entries) == 2
+
+
+@pytest.mark.parametrize(
+    (
+        "unique_id",
+        "config_entry_data",
+        "config_flow_responses",
+    ),
+    [
+        (
+            SERIAL_NUMBER,
+            CONFIG_ENTRY_DATA,
+            [mock_response(SERIAL_RESPONSE)],
+        ),
+        (
+            None,
+            {**CONFIG_ENTRY_DATA, "serial_number": 0},
+            [mock_response(ZERO_SERIAL_RESPONSE)],
+        ),
+    ],
+    ids=[
+        "duplicate-serial-number",
+        "duplicate-host-port-no-serial",
+    ],
+)
+async def test_duplicate_config_entries(
+    hass: HomeAssistant,
+    setup_integration: ComponentSetup,
+    responses: list[AiohttpClientMockResponse],
+    config_flow_responses: list[AiohttpClientMockResponse],
+) -> None:
+    """Test that a device can not be registered twice."""
+    assert await setup_integration()
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert len(entries) == 1
+    assert entries[0].state == ConfigEntryState.LOADED
+
+    responses.clear()
+    responses.extend(config_flow_responses)
+
+    result = await complete_flow(hass)
+    assert result.get("type") == FlowResultType.ABORT
+    assert result.get("reason") == "already_configured"
+
+
+async def test_controller_cannot_connect(
+    hass: HomeAssistant,
+    mock_setup: Mock,
+    responses: list[AiohttpClientMockResponse],
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """Test an error talking to the controller."""
+
+    # Controller response with a failure
+    responses.clear()
+    responses.append(
+        AiohttpClientMockResponse("POST", URL, status=HTTPStatus.SERVICE_UNAVAILABLE)
+    )
+
+    result = await complete_flow(hass)
+    assert result.get("type") == FlowResultType.FORM
+    assert result.get("step_id") == "user"
+    assert result.get("errors") == {"base": "cannot_connect"}
+
+    assert not mock_setup.mock_calls
+
+
+async def test_controller_timeout(
+    hass: HomeAssistant,
+    mock_setup: Mock,
+) -> None:
+    """Test an error talking to the controller."""
+
+    with patch(
+        "homeassistant.components.rainbird.config_flow.asyncio.timeout",
+        side_effect=asyncio.TimeoutError,
+    ):
+        result = await complete_flow(hass)
+        assert result.get("type") == FlowResultType.FORM
+        assert result.get("step_id") == "user"
+        assert result.get("errors") == {"base": "timeout_connect"}
+
+    assert not mock_setup.mock_calls
+
+
+async def test_options_flow(hass: HomeAssistant, mock_setup: Mock) -> None:
+    """Test config flow options."""
+
+    # Setup config flow
+    result = await complete_flow(hass)
+    assert result.get("type") == "create_entry"
+    assert result.get("title") == HOST
+    assert "result" in result
+    assert result["result"].data == CONFIG_ENTRY_DATA
+    assert result["result"].options == {ATTR_DURATION: 6}
+
+    # Assert single config entry is loaded
+    config_entry = next(iter(hass.config_entries.async_entries(DOMAIN)))
+    assert config_entry.state == ConfigEntryState.LOADED
+
+    # Initiate the options flow
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    assert result.get("type") == FlowResultType.FORM
+    assert result.get("step_id") == "init"
+
+    # Change the default duration
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], user_input={ATTR_DURATION: 5}
+    )
+    assert result.get("type") == FlowResultType.CREATE_ENTRY
+    assert config_entry.options == {
+        ATTR_DURATION: 5,
+    }
